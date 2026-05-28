@@ -3,12 +3,14 @@ package store
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gopasspw/gopass/pkg/ctxutil"
 	"github.com/gopasspw/gopass/pkg/gopass"
 	"github.com/gopasspw/gopass/pkg/gopass/api"
 	"github.com/gopasspw/gopass/pkg/gopass/secrets"
@@ -31,6 +33,12 @@ type GopassStore struct {
 	mapper *Mapper
 	locked map[string]bool // collection name -> locked state
 
+	// agePwCb, when non-nil, is attached to every gopass call's context so the
+	// age backend can decrypt non-interactively. The gopass CLI does this in
+	// its own main.go when GOPASS_AGE_PASSWORD is set; since we link gopass as
+	// a library, we have to install the callback ourselves.
+	agePwCb ctxutil.PasswordCallback
+
 	// metaCache memoizes the decrypted *metadata* of an entry (its gopass
 	// Keys()/values: labels, timestamps and searchable attributes) keyed by
 	// store path. It deliberately never holds the secret payload (Password or
@@ -46,11 +54,17 @@ type GopassStore struct {
 
 // NewGopassStore creates a new GoPass-backed store
 func NewGopassStore(ctx context.Context, prefix string) (*GopassStore, error) {
+	cb := agePasswordCallbackFromEnv()
+	if cb != nil {
+		ctx = ctxutil.WithPasswordCallback(ctx, cb)
+	}
 	store, err := api.New(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize gopass: %w", err)
 	}
-	return NewGopassStoreWithBackend(store, prefix), nil
+	s := NewGopassStoreWithBackend(store, prefix)
+	s.agePwCb = cb
+	return s, nil
 }
 
 // NewGopassStoreWithBackend builds a store over an arbitrary gopass.Store
@@ -63,6 +77,29 @@ func NewGopassStoreWithBackend(backend gopass.Store, prefix string) *GopassStore
 		locked:    make(map[string]bool),
 		metaCache: make(map[string]map[string]string),
 	}
+}
+
+// agePasswordCallbackFromEnv mirrors the gopass CLI's GOPASS_AGE_PASSWORD
+// handling (gopass main.go) so age-encrypted stores can be unlocked headlessly
+// when the daemon runs under DBus activation.
+func agePasswordCallbackFromEnv() ctxutil.PasswordCallback {
+	pw, ok := os.LookupEnv("GOPASS_AGE_PASSWORD")
+	if !ok {
+		return nil
+	}
+	return func(_ string, _ bool) ([]byte, error) {
+		return []byte(pw), nil
+	}
+}
+
+// withPwCb attaches the age password callback (if configured) to ctx. The age
+// backend reads the callback from the per-call context, so this must be called
+// at every gopass-store entry point that may decrypt or encrypt.
+func (s *GopassStore) withPwCb(ctx context.Context) context.Context {
+	if s.agePwCb == nil {
+		return ctx
+	}
+	return ctxutil.WithPasswordCallback(ctx, s.agePwCb)
 }
 
 // metaFromSecret extracts a decrypted entry's metadata key/value pairs. By
@@ -89,7 +126,7 @@ func (s *GopassStore) metaFor(ctx context.Context, path string) (map[string]stri
 		return m, nil
 	}
 
-	sec, err := s.store.Get(ctx, path, "latest")
+	sec, err := s.store.Get(s.withPwCb(ctx), path, "latest")
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +193,7 @@ func applyItemMeta(item *ItemData, meta map[string]string) {
 
 // Collections returns all collection names
 func (s *GopassStore) Collections(ctx context.Context) ([]string, error) {
-	allPaths, err := s.store.List(ctx)
+	allPaths, err := s.store.List(s.withPwCb(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +236,7 @@ func (s *GopassStore) GetCollection(ctx context.Context, name string) (*Collecti
 		items, err := s.Items(ctx, name)
 		if err != nil || len(items) == 0 {
 			// Try listing to see if collection exists
-			allPaths, listErr := s.store.List(ctx)
+			allPaths, listErr := s.store.List(s.withPwCb(ctx))
 			if listErr != nil {
 				return nil, fmt.Errorf("collection not found: %s", name)
 			}
@@ -267,7 +304,7 @@ func (s *GopassStore) CreateCollection(ctx context.Context, name, label string) 
 		return fmt.Errorf("set modified: %w", err)
 	}
 
-	if err := s.store.Set(ctx, metaPath, sec); err != nil {
+	if err := s.store.Set(s.withPwCb(ctx), metaPath, sec); err != nil {
 		return err
 	}
 	s.invalidateMeta(metaPath)
@@ -277,7 +314,7 @@ func (s *GopassStore) CreateCollection(ctx context.Context, name, label string) 
 // DeleteCollection deletes a collection and all its items
 func (s *GopassStore) DeleteCollection(ctx context.Context, name string) error {
 	collPath := s.mapper.CollectionPath(name)
-	if err := s.store.RemoveAll(ctx, collPath); err != nil {
+	if err := s.store.RemoveAll(s.withPwCb(ctx), collPath); err != nil {
 		return err
 	}
 	s.invalidateMetaPrefix(collPath)
@@ -306,7 +343,7 @@ func (s *GopassStore) SetCollectionLabel(ctx context.Context, name, label string
 		return fmt.Errorf("set modified: %w", err)
 	}
 
-	if err := s.store.Set(ctx, metaPath, sec); err != nil {
+	if err := s.store.Set(s.withPwCb(ctx), metaPath, sec); err != nil {
 		return err
 	}
 	s.invalidateMeta(metaPath)
@@ -315,7 +352,7 @@ func (s *GopassStore) SetCollectionLabel(ctx context.Context, name, label string
 
 // Items returns all item IDs in a collection
 func (s *GopassStore) Items(ctx context.Context, collection string) ([]string, error) {
-	allPaths, err := s.store.List(ctx)
+	allPaths, err := s.store.List(s.withPwCb(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +386,7 @@ func (s *GopassStore) GetItem(ctx context.Context, collection, id string) (*Item
 	itemPath := s.mapper.ItemPath(collection, id)
 
 	// Secret retrieval always decrypts fresh — the password is never cached.
-	sec, err := s.store.Get(ctx, itemPath, "latest")
+	sec, err := s.store.Get(s.withPwCb(ctx), itemPath, "latest")
 	if err != nil {
 		return nil, fmt.Errorf("item not found: %s/%s", collection, id)
 	}
@@ -424,7 +461,7 @@ func (s *GopassStore) CreateItem(ctx context.Context, collection string, item *I
 	}
 
 	itemPath := s.mapper.ItemPath(collection, item.ID)
-	if err := s.store.Set(ctx, itemPath, sec); err != nil {
+	if err := s.store.Set(s.withPwCb(ctx), itemPath, sec); err != nil {
 		return "", err
 	}
 	s.invalidateMeta(itemPath)
@@ -474,7 +511,7 @@ func (s *GopassStore) UpdateItem(ctx context.Context, collection, id string, ite
 	}
 
 	itemPath := s.mapper.ItemPath(collection, id)
-	if err := s.store.Set(ctx, itemPath, sec); err != nil {
+	if err := s.store.Set(s.withPwCb(ctx), itemPath, sec); err != nil {
 		return err
 	}
 	s.invalidateMeta(itemPath)
@@ -484,7 +521,7 @@ func (s *GopassStore) UpdateItem(ctx context.Context, collection, id string, ite
 // DeleteItem deletes an item
 func (s *GopassStore) DeleteItem(ctx context.Context, collection, id string) error {
 	itemPath := s.mapper.ItemPath(collection, id)
-	if err := s.store.Remove(ctx, itemPath); err != nil {
+	if err := s.store.Remove(s.withPwCb(ctx), itemPath); err != nil {
 		return err
 	}
 	s.invalidateMeta(itemPath)
@@ -559,7 +596,7 @@ func (s *GopassStore) UnlockCollection(ctx context.Context, name string) error {
 // GetAlias returns the collection name for an alias
 func (s *GopassStore) GetAlias(ctx context.Context, alias string) (string, error) {
 	aliasPath := s.mapper.AliasesPath()
-	sec, err := s.store.Get(ctx, aliasPath, "latest")
+	sec, err := s.store.Get(s.withPwCb(ctx), aliasPath, "latest")
 	if err != nil {
 		// Handle default alias specially
 		if alias == "default" {
@@ -585,7 +622,7 @@ func (s *GopassStore) SetAlias(ctx context.Context, alias, collection string) er
 
 	// Get existing aliases
 	aliases := make(map[string]string)
-	sec, err := s.store.Get(ctx, aliasPath, "latest")
+	sec, err := s.store.Get(s.withPwCb(ctx), aliasPath, "latest")
 	if err == nil {
 		for _, key := range sec.Keys() {
 			if val, ok := sec.Get(key); ok {
@@ -610,12 +647,12 @@ func (s *GopassStore) SetAlias(ctx context.Context, alias, collection string) er
 		}
 	}
 
-	return s.store.Set(ctx, aliasPath, newSec)
+	return s.store.Set(s.withPwCb(ctx), aliasPath, newSec)
 }
 
 // Close closes the store
 func (s *GopassStore) Close(ctx context.Context) error {
-	return s.store.Close(ctx)
+	return s.store.Close(s.withPwCb(ctx))
 }
 
 func matchesAttributes(item *ItemData, attrs map[string]string) bool {
